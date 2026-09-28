@@ -26,7 +26,7 @@ PORT = int(
 
 
 # ============================================================
-# STARTUP CHECK
+# STARTUP
 # ============================================================
 
 print("=" * 60, flush=True)
@@ -54,35 +54,25 @@ class HealthHandler(BaseHTTPRequestHandler):
 
             response = b"Phantom AI Trader is running!"
 
-            self.send_response(200)
-            self.send_header(
-                "Content-Type",
-                "text/plain"
-            )
-            self.send_header(
-                "Content-Length",
-                str(len(response))
-            )
-            self.end_headers()
-
-            self.wfile.write(response)
-
         else:
 
             response = b"Phantom AI Trader"
 
-            self.send_response(200)
-            self.send_header(
-                "Content-Type",
-                "text/plain"
-            )
-            self.send_header(
-                "Content-Length",
-                str(len(response))
-            )
-            self.end_headers()
+        self.send_response(200)
 
-            self.wfile.write(response)
+        self.send_header(
+            "Content-Type",
+            "text/plain"
+        )
+
+        self.send_header(
+            "Content-Length",
+            str(len(response))
+        )
+
+        self.end_headers()
+
+        self.wfile.write(response)
 
     def log_message(self, format, *args):
         return
@@ -128,17 +118,11 @@ print(
 
 
 # ============================================================
-# DISCORD INTENTS
+# DISCORD
 # ============================================================
 
 intents = discord.Intents.default()
-
 intents.message_content = True
-
-
-# ============================================================
-# DISCORD BOT
-# ============================================================
 
 bot = commands.Bot(
     command_prefix="!",
@@ -156,7 +140,22 @@ paper_positions = {}
 
 
 # ============================================================
-# DISCORD READY
+# HELPER — GET RISK SCORE
+# ============================================================
+
+def get_risk_score(report):
+
+    if hasattr(report, "risk_score"):
+        return report.risk_score
+
+    if hasattr(report, "score"):
+        return report.score
+
+    return 0
+
+
+# ============================================================
+# BOT READY
 # ============================================================
 
 @bot.event
@@ -253,10 +252,12 @@ async def analyze(
 
         report = await analyze_token(token)
 
+        risk_score = get_risk_score(report)
+
         message = (
             f"🔎 **TOKEN ANALYSIS**\n\n"
             f"**Token:** `{token}`\n"
-            f"**Risk Score:** `{report.score}/100`\n"
+            f"**Risk Score:** `{risk_score}/100`\n"
             f"**Risk Level:** `{report.risk_level}`\n"
             f"**Decision:** `{report.decision}`\n\n"
             f"**Liquidity:** "
@@ -287,7 +288,7 @@ async def analyze(
         print(
             f"ANALYSIS COMPLETE | "
             f"TOKEN={token} | "
-            f"SCORE={report.score} | "
+            f"SCORE={risk_score} | "
             f"DECISION={report.decision}",
             flush=True
         )
@@ -365,10 +366,12 @@ async def paperbuy(
 
         if report.decision != "BUY-CANDIDATE":
 
+            risk_score = get_risk_score(report)
+
             await interaction.followup.send(
                 f"🛑 **PAPER BUY BLOCKED**\n\n"
                 f"**Token:** `{token}`\n"
-                f"**Risk Score:** `{report.score}/100`\n"
+                f"**Risk Score:** `{risk_score}/100`\n"
                 f"**Risk Level:** `{report.risk_level}`\n"
                 f"**Decision:** `{report.decision}`\n\n"
                 f"The risk engine did not approve "
@@ -397,6 +400,8 @@ async def paperbuy(
                 "entry_price": report.price
             }
 
+        risk_score = get_risk_score(report)
+
         await interaction.followup.send(
             f"🟢 **PAPER BUY EXECUTED**\n\n"
             f"**Token:** `{token}`\n"
@@ -404,7 +409,7 @@ async def paperbuy(
             f"**Entry Price:** "
             f"${report.price:.10f}\n"
             f"**Risk Score:** "
-            f"{report.score}/100\n"
+            f"{risk_score}/100\n"
             f"**Remaining Balance:** "
             f"${paper_balance:,.2f}"
         )
@@ -477,9 +482,7 @@ async def positions(
             f"${position['entry_price']:.10f}\n\n"
         )
 
-    await interaction.response.send_message(
-        message
-    )
+    await interaction.response.send_message(message)
 
 
 # ============================================================
@@ -530,7 +533,7 @@ async def panic(
 
 
 # ============================================================
-# DISCORD ERROR HANDLER
+# ERROR HANDLER
 # ============================================================
 
 @bot.event
@@ -543,7 +546,7 @@ async def on_error(event, *args, **kwargs):
 
 
 # ============================================================
-# START DISCORD BOT
+# START
 # ============================================================
 
 print(
