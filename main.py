@@ -1,52 +1,26 @@
 import os
-import asyncio
 import logging
-import time
-from dataclasses import dataclass, field
-from typing import Optional
 
-import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
+
+from risk_engine import analyze_token
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# SAFETY: real trading stays OFF until we deliberately enable it.
-LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
+LIVE_TRADING = (
+    os.getenv("LIVE_TRADING", "false").lower() == "true"
+)
 
-# Paper-trading starting balance
-PAPER_BALANCE_USD = float(os.getenv("PAPER_BALANCE_USD", "1000"))
-
-# Maximum percentage of paper/live balance allowed in one position
-MAX_POSITION_PERCENT = float(os.getenv("MAX_POSITION_PERCENT", "5"))
-
-# Maximum loss allowed before the position is automatically closed
-STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "12"))
-
-# Take-profit level
-TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", "30"))
-
-# Trailing stop after a position becomes profitable
-TRAILING_STOP_PERCENT = float(os.getenv("TRAILING_STOP_PERCENT", "10"))
-
-# Minimum liquidity required before considering a token
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "25000"))
-
-# Minimum 24h volume
-MIN_VOLUME_USD = float(os.getenv("MIN_VOLUME_USD", "10000"))
-
-# Minimum token age in seconds.
-# Keeping this above zero prevents blindly buying brand-new pools.
-MIN_TOKEN_AGE_SECONDS = int(os.getenv("MIN_TOKEN_AGE_SECONDS", "300"))
-
-# Discord command cooldown
-ANALYZE_COOLDOWN_SECONDS = 5
+PAPER_BALANCE = float(
+    os.getenv("PAPER_BALANCE_USD", "1000")
+)
 
 
 # ============================================================
@@ -62,473 +36,11 @@ logger = logging.getLogger("phantom-ai-trader")
 
 
 # ============================================================
-# DATA STRUCTURES
+# PAPER PORTFOLIO
 # ============================================================
 
-@dataclass
-class TokenAnalysis:
-    address: str
-    symbol: str = "UNKNOWN"
-    name: str = "Unknown"
-
-    price_usd: float = 0.0
-    market_cap: float = 0.0
-    liquidity_usd: float = 0.0
-    volume_24h: float = 0.0
-
-    price_change_5m: float = 0.0
-    price_change_1h: float = 0.0
-    price_change_24h: float = 0.0
-
-    buys_5m: int = 0
-    sells_5m: int = 0
-
-    pair_age_seconds: Optional[float] = None
-
-    risk_score: int = 100
-    decision: str = "NO-TRADE"
-
-    reasons: list[str] = field(default_factory=list)
-
-
-@dataclass
-class Position:
-    token_address: str
-    symbol: str
-
-    entry_price: float
-    quantity: float
-    invested_usd: float
-
-    highest_price: float
-    opened_at: float = field(default_factory=time.time)
-
-    realized_pnl: float = 0.0
-
-
-# ============================================================
-# PAPER TRADING PORTFOLIO
-# ============================================================
-
-class PaperPortfolio:
-
-    def __init__(self):
-        self.starting_balance = PAPER_BALANCE_USD
-        self.cash = PAPER_BALANCE_USD
-        self.positions: dict[str, Position] = {}
-
-    def position_value(self, prices: dict[str, float]) -> float:
-        total = 0.0
-
-        for address, position in self.positions.items():
-            price = prices.get(address, position.entry_price)
-            total += position.quantity * price
-
-        return total
-
-    def total_equity(self, prices: dict[str, float]) -> float:
-        return self.cash + self.position_value(prices)
-
-    def buy(
-        self,
-        analysis: TokenAnalysis,
-        amount_usd: float,
-    ) -> tuple[bool, str]:
-
-        if analysis.price_usd <= 0:
-            return False, "Invalid token price."
-
-        if amount_usd <= 0:
-            return False, "Invalid amount."
-
-        if amount_usd > self.cash:
-            return False, "Insufficient paper balance."
-
-        if analysis.address in self.positions:
-            return False, "Position already exists."
-
-        quantity = amount_usd / analysis.price_usd
-
-        self.cash -= amount_usd
-
-        self.positions[analysis.address] = Position(
-            token_address=analysis.address,
-            symbol=analysis.symbol,
-            entry_price=analysis.price_usd,
-            quantity=quantity,
-            invested_usd=amount_usd,
-            highest_price=analysis.price_usd,
-        )
-
-        return True, (
-            f"Paper BUY {analysis.symbol} | "
-            f"${amount_usd:,.2f} | "
-            f"Entry ${analysis.price_usd:.10f}"
-        )
-
-    def sell(
-        self,
-        analysis: TokenAnalysis,
-        reason: str,
-    ) -> tuple[bool, str]:
-
-        position = self.positions.get(analysis.address)
-
-        if not position:
-            return False, "No position exists."
-
-        exit_value = position.quantity * analysis.price_usd
-        pnl = exit_value - position.invested_usd
-
-        self.cash += exit_value
-
-        del self.positions[analysis.address]
-
-        return True, (
-            f"Paper SELL {analysis.symbol} | "
-            f"Value ${exit_value:,.2f} | "
-            f"PnL ${pnl:,.2f} | "
-            f"Reason: {reason}"
-        )
-
-
-portfolio = PaperPortfolio()
-
-
-# ============================================================
-# MARKET DATA
-# ============================================================
-
-DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
-
-
-async def fetch_token(address: str) -> Optional[TokenAnalysis]:
-
-    url = DEXSCREENER_URL.format(address)
-
-    timeout = aiohttp.ClientTimeout(total=10)
-
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-
-            async with session.get(
-                url,
-                headers={
-                    "User-Agent": "Phantom-AI-Trader/1.0"
-                },
-            ) as response:
-
-                if response.status != 200:
-                    logger.warning(
-                        "DexScreener returned HTTP %s",
-                        response.status,
-                    )
-                    return None
-
-                data = await response.json()
-
-    except Exception as exc:
-        logger.error("Market data error: %s", exc)
-        return None
-
-    pairs = data.get("pairs") or []
-
-    # We currently focus on Solana.
-    solana_pairs = [
-        pair
-        for pair in pairs
-        if pair.get("chainId") == "solana"
-    ]
-
-    if not solana_pairs:
-        return None
-
-    # Choose the pair with the greatest liquidity.
-    pair = max(
-        solana_pairs,
-        key=lambda p: float(
-            (p.get("liquidity") or {}).get("usd") or 0
-        ),
-    )
-
-    base = pair.get("baseToken") or {}
-    txns = pair.get("txns") or {}
-    volume = pair.get("volume") or {}
-    liquidity = pair.get("liquidity") or {}
-    price_change = pair.get("priceChange") or {}
-
-    price = float(pair.get("priceUsd") or 0)
-
-    liquidity_usd = float(liquidity.get("usd") or 0)
-    volume_24h = float(volume.get("h24") or 0)
-
-    market_cap = float(
-        pair.get("marketCap")
-        or pair.get("fdv")
-        or 0
-    )
-
-    buys_5m = int(
-        (txns.get("m5") or {}).get("buys") or 0
-    )
-
-    sells_5m = int(
-        (txns.get("m5") or {}).get("sells") or 0
-    )
-
-    pair_created = pair.get("pairCreatedAt")
-
-    pair_age_seconds = None
-
-    if pair_created:
-        pair_age_seconds = max(
-            0,
-            time.time() - (pair_created / 1000),
-        )
-
-    return TokenAnalysis(
-        address=address,
-        symbol=base.get("symbol") or "UNKNOWN",
-        name=base.get("name") or "Unknown",
-        price_usd=price,
-        market_cap=market_cap,
-        liquidity_usd=liquidity_usd,
-        volume_24h=volume_24h,
-        price_change_5m=float(price_change.get("m5") or 0),
-        price_change_1h=float(price_change.get("h1") or 0),
-        price_change_24h=float(price_change.get("h24") or 0),
-        buys_5m=buys_5m,
-        sells_5m=sells_5m,
-        pair_age_seconds=pair_age_seconds,
-    )
-
-
-# ============================================================
-# RISK / DECISION ENGINE
-# ============================================================
-
-def analyze_risk(analysis: TokenAnalysis) -> TokenAnalysis:
-
-    score = 100
-    reasons = []
-
-    # --------------------------------------------------------
-    # LIQUIDITY
-    # --------------------------------------------------------
-
-    if analysis.liquidity_usd < MIN_LIQUIDITY_USD:
-        score -= 40
-        reasons.append(
-            "Liquidity below minimum threshold"
-        )
-
-    elif analysis.liquidity_usd < MIN_LIQUIDITY_USD * 2:
-        score -= 15
-        reasons.append(
-            "Liquidity is relatively thin"
-        )
-
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
-
-    if analysis.volume_24h < MIN_VOLUME_USD:
-        score -= 20
-        reasons.append(
-            "24h volume is too low"
-        )
-
-    # --------------------------------------------------------
-    # TOKEN AGE
-    # --------------------------------------------------------
-
-    if analysis.pair_age_seconds is not None:
-
-        if analysis.pair_age_seconds < MIN_TOKEN_AGE_SECONDS:
-            score -= 30
-            reasons.append(
-                "Trading pair is extremely new"
-            )
-
-    # --------------------------------------------------------
-    # BUY/SELL BALANCE
-    # --------------------------------------------------------
-
-    total_trades = (
-        analysis.buys_5m +
-        analysis.sells_5m
-    )
-
-    if total_trades > 0:
-
-        sell_ratio = (
-            analysis.sells_5m /
-            total_trades
-        )
-
-        if sell_ratio > 0.75:
-            score -= 35
-            reasons.append(
-                "Heavy selling pressure"
-            )
-
-        elif sell_ratio > 0.60:
-            score -= 15
-            reasons.append(
-                "Elevated selling pressure"
-            )
-
-    # --------------------------------------------------------
-    # PRICE BEHAVIOR
-    # --------------------------------------------------------
-
-    if analysis.price_change_5m < -15:
-        score -= 30
-        reasons.append(
-            "Sharp 5-minute price decline"
-        )
-
-    elif analysis.price_change_5m < -8:
-        score -= 15
-        reasons.append(
-            "Significant short-term decline"
-        )
-
-    # --------------------------------------------------------
-    # EXTREME PUMP PROTECTION
-    # --------------------------------------------------------
-
-    if analysis.price_change_5m > 80:
-        score -= 25
-        reasons.append(
-            "Extreme short-term price spike"
-        )
-
-    elif analysis.price_change_5m > 40:
-        score -= 10
-        reasons.append(
-            "Large short-term price spike"
-        )
-
-    # --------------------------------------------------------
-    # FINAL SCORE
-    # --------------------------------------------------------
-
-    score = max(0, min(100, score))
-
-    analysis.risk_score = score
-    analysis.reasons = reasons
-
-    # Decision thresholds
-    #
-    # 75-100 = BUY candidate
-    # 50-74  = HOLD / WAIT
-    # below 50 = NO TRADE
-
-    if score >= 75:
-        analysis.decision = "BUY"
-
-    elif score >= 50:
-        analysis.decision = "HOLD"
-
-    else:
-        analysis.decision = "NO-TRADE"
-
-    return analysis
-
-
-# ============================================================
-# POSITION PROTECTION
-# ============================================================
-
-def check_position_exit(
-    position: Position,
-    analysis: TokenAnalysis,
-) -> Optional[str]:
-
-    current_price = analysis.price_usd
-
-    if current_price <= 0:
-        return "Invalid price"
-
-    # Update highest observed price
-    if current_price > position.highest_price:
-        position.highest_price = current_price
-
-    pnl_percent = (
-        (current_price - position.entry_price)
-        / position.entry_price
-    ) * 100
-
-    # --------------------------------------------------------
-    # HARD STOP LOSS
-    # --------------------------------------------------------
-
-    if pnl_percent <= -STOP_LOSS_PERCENT:
-        return (
-            f"Stop loss triggered "
-            f"({pnl_percent:.2f}%)"
-        )
-
-    # --------------------------------------------------------
-    # LIQUIDITY EMERGENCY EXIT
-    # --------------------------------------------------------
-
-    if analysis.liquidity_usd < MIN_LIQUIDITY_USD * 0.50:
-        return "Liquidity emergency"
-
-    # --------------------------------------------------------
-    # HEAVY SELLING
-    # --------------------------------------------------------
-
-    total = (
-        analysis.buys_5m +
-        analysis.sells_5m
-    )
-
-    if total >= 10:
-
-        sell_ratio = (
-            analysis.sells_5m / total
-        )
-
-        if sell_ratio >= 0.85:
-            return "Extreme selling pressure"
-
-    # --------------------------------------------------------
-    # TAKE PROFIT
-    # --------------------------------------------------------
-
-    if pnl_percent >= TAKE_PROFIT_PERCENT:
-        return (
-            f"Take profit reached "
-            f"({pnl_percent:.2f}%)"
-        )
-
-    # --------------------------------------------------------
-    # TRAILING STOP
-    # --------------------------------------------------------
-
-    if (
-        position.highest_price >
-        position.entry_price * 1.10
-    ):
-
-        drop_from_high = (
-            (
-                position.highest_price -
-                current_price
-            )
-            / position.highest_price
-        ) * 100
-
-        if drop_from_high >= TRAILING_STOP_PERCENT:
-            return (
-                f"Trailing stop triggered "
-                f"({drop_from_high:.2f}% from high)"
-            )
-
-    return None
+paper_cash = PAPER_BALANCE
+positions = {}
 
 
 # ============================================================
@@ -545,18 +57,24 @@ bot = commands.Bot(
 
 
 # ============================================================
-# DISCORD EVENTS
+# BOT READY
 # ============================================================
 
 @bot.event
 async def on_ready():
 
+    logger.info("==========================================")
+    logger.info("PHANTOM AI TRADER ONLINE")
+    logger.info("BOT USER: %s", bot.user)
     logger.info(
-        "PHANTOM AI TRADER ONLINE | User=%s",
-        bot.user,
+        "TRADING MODE: %s",
+        "LIVE" if LIVE_TRADING else "PAPER",
     )
+    logger.info("PAPER BALANCE: $%.2f", paper_cash)
+    logger.info("==========================================")
 
     try:
+
         synced = await bot.tree.sync()
 
         logger.info(
@@ -564,14 +82,18 @@ async def on_ready():
             len(synced),
         )
 
+        for command in synced:
+            logger.info(
+                "REGISTERED: /%s",
+                command.name,
+            )
+
     except Exception as exc:
-        logger.error(
-            "COMMAND SYNC ERROR | %s",
+
+        logger.exception(
+            "COMMAND SYNC ERROR: %s",
             exc,
         )
-
-    if not monitor_positions.is_running():
-        monitor_positions.start()
 
 
 # ============================================================
@@ -582,19 +104,19 @@ async def on_ready():
     name="status",
     description="Show Phantom AI Trader status",
 )
-async def status(interaction: discord.Interaction):
-
-    equity = portfolio.total_equity({})
+async def status(
+    interaction: discord.Interaction,
+):
 
     mode = (
-        "LIVE TRADING"
+        "🔴 LIVE TRADING"
         if LIVE_TRADING
-        else "PAPER TRADING"
+        else "🟢 PAPER TRADING"
     )
 
     embed = discord.Embed(
         title="🤖 Phantom AI Trader",
-        description="AI risk engine status",
+        description="Current bot status",
     )
 
     embed.add_field(
@@ -604,26 +126,26 @@ async def status(interaction: discord.Interaction):
     )
 
     embed.add_field(
-        name="Cash",
-        value=f"${portfolio.cash:,.2f}",
+        name="Paper Cash",
+        value=f"${paper_cash:,.2f}",
         inline=True,
     )
 
     embed.add_field(
-        name="Positions",
-        value=str(len(portfolio.positions)),
+        name="Open Positions",
+        value=str(len(positions)),
         inline=True,
     )
 
     embed.add_field(
-        name="Equity",
-        value=f"${equity:,.2f}",
+        name="Risk Engine",
+        value="🟢 ONLINE",
         inline=True,
     )
 
     embed.add_field(
-        name="Live Trading",
-        value=str(LIVE_TRADING),
+        name="Real Wallet",
+        value="🔒 NOT CONNECTED",
         inline=True,
     )
 
@@ -639,7 +161,7 @@ async def status(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="analyze",
-    description="Analyze a Solana token",
+    description="Run the AI risk engine on a Solana token",
 )
 @app_commands.describe(
     token="Solana token mint address",
@@ -652,85 +174,139 @@ async def analyze(
     await interaction.response.defer()
 
     logger.info(
-        "ANALYZE | TOKEN=%s | USER=%s",
+        "ANALYSIS REQUEST | TOKEN=%s | USER=%s",
         token,
         interaction.user,
     )
 
-    analysis = await fetch_token(token)
+    try:
 
-    if not analysis:
+        report = await analyze_token(token)
+
+    except Exception as exc:
+
+        logger.exception(
+            "RISK ENGINE ERROR: %s",
+            exc,
+        )
 
         await interaction.followup.send(
-            "❌ I couldn't find usable Solana market data for that token."
+            "❌ The risk engine encountered an error."
         )
 
         return
 
-    analysis = analyze_risk(analysis)
+    if report.decision == "BUY-CANDIDATE":
 
-    reasons = (
-        "\n".join(
-            f"• {reason}"
-            for reason in analysis.reasons
-        )
-        if analysis.reasons
-        else "No major negative signals detected."
-    )
+        decision_text = "🟢 BUY CANDIDATE"
+
+    elif report.decision == "WAIT":
+
+        decision_text = "🟡 WAIT"
+
+    else:
+
+        decision_text = "🔴 NO TRADE"
 
     embed = discord.Embed(
-        title=f"🧠 {analysis.symbol} Risk Analysis",
-    )
-
-    embed.add_field(
-        name="Decision",
-        value=analysis.decision,
-        inline=True,
+        title="🧠 Phantom AI Risk Analysis",
+        description=(
+            f"**{report.decision}**\n"
+            f"{decision_text}"
+        ),
     )
 
     embed.add_field(
         name="Risk Score",
-        value=f"{analysis.risk_score}/100",
+        value=f"{report.risk_score}/100",
         inline=True,
     )
 
     embed.add_field(
-        name="Price",
-        value=f"${analysis.price_usd:.10f}",
+        name="Risk Level",
+        value=report.risk_level,
         inline=True,
     )
 
     embed.add_field(
         name="Liquidity",
-        value=f"${analysis.liquidity_usd:,.0f}",
+        value=f"${report.liquidity_usd:,.0f}",
         inline=True,
     )
 
     embed.add_field(
         name="24h Volume",
-        value=f"${analysis.volume_24h:,.0f}",
+        value=f"${report.volume_24h_usd:,.0f}",
         inline=True,
     )
 
     embed.add_field(
-        name="5m Change",
-        value=f"{analysis.price_change_5m:.2f}%",
+        name="Market Cap",
+        value=f"${report.market_cap_usd:,.0f}",
         inline=True,
     )
 
+    if report.top_holder_percent is not None:
+
+        holder_text = (
+            f"{report.top_holder_percent:.2f}%"
+        )
+
+    else:
+
+        holder_text = "Unavailable"
+
     embed.add_field(
-        name="5m Buys / Sells",
-        value=(
-            f"{analysis.buys_5m} / "
-            f"{analysis.sells_5m}"
-        ),
+        name="Top Holder",
+        value=holder_text,
         inline=True,
     )
+
+    # --------------------------------------------------------
+    # RISK REASONS
+    # --------------------------------------------------------
+
+    if report.reasons:
+
+        reasons_text = "\n".join(
+            f"• {reason}"
+            for reason in report.reasons
+        )
+
+    else:
+
+        reasons_text = (
+            "No major negative signals returned."
+        )
 
     embed.add_field(
         name="Risk Signals",
-        value=reasons[:1024],
+        value=reasons_text[:1024],
         inline=False,
+    )
+
+    # --------------------------------------------------------
+    # WARNINGS
+    # --------------------------------------------------------
+
+    if report.warnings:
+
+        warnings_text = "\n".join(
+            f"• {warning}"
+            for warning in report.warnings
+        )
+
+        embed.add_field(
+            name="Warnings",
+            value=warnings_text[:1024],
+            inline=False,
+        )
+
+    embed.set_footer(
+        text=(
+            "Risk analysis is not a guarantee against "
+            "loss or a rug."
+        )
     )
 
     await interaction.followup.send(
@@ -744,11 +320,11 @@ async def analyze(
 
 @bot.tree.command(
     name="paperbuy",
-    description="Simulate buying a token",
+    description="Simulate a trade after risk analysis",
 )
 @app_commands.describe(
     token="Solana token mint address",
-    amount="USD amount",
+    amount="USD amount to simulate",
 )
 async def paperbuy(
     interaction: discord.Interaction,
@@ -756,54 +332,108 @@ async def paperbuy(
     amount: float,
 ):
 
+    global paper_cash
+
     await interaction.response.defer()
 
-    analysis = await fetch_token(token)
+    # --------------------------------------------------------
+    # BASIC AMOUNT CHECK
+    # --------------------------------------------------------
 
-    if not analysis:
+    if amount <= 0:
 
         await interaction.followup.send(
-            "❌ Could not retrieve token data."
+            "❌ Amount must be greater than $0."
         )
 
         return
 
-    analysis = analyze_risk(analysis)
+    # Maximum paper position = 5% of starting balance
+    max_position = PAPER_BALANCE * 0.05
 
-    # The risk engine gets the final say.
-    if analysis.decision != "BUY":
+    if amount > max_position:
 
         await interaction.followup.send(
-            f"🛑 Trade rejected.\n\n"
-            f"Decision: **{analysis.decision}**\n"
-            f"Risk score: **{analysis.risk_score}/100**\n\n"
+            f"🛑 Position rejected.\n\n"
+            f"Maximum paper position: "
+            f"**${max_position:,.2f}**"
+        )
+
+        return
+
+    if amount > paper_cash:
+
+        await interaction.followup.send(
+            "❌ Insufficient paper balance."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # RUN RISK ENGINE
+    # --------------------------------------------------------
+
+    try:
+
+        report = await analyze_token(token)
+
+    except Exception as exc:
+
+        logger.exception(
+            "PAPER BUY ANALYSIS ERROR: %s",
+            exc,
+        )
+
+        await interaction.followup.send(
+            "❌ Risk analysis failed. "
+            "Trade rejected for safety."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # RISK ENGINE MUST APPROVE
+    # --------------------------------------------------------
+
+    if report.decision != "BUY-CANDIDATE":
+
+        await interaction.followup.send(
+            f"🛑 **TRADE REJECTED**\n\n"
+            f"Decision: **{report.decision}**\n"
+            f"Risk score: **{report.risk_score}/100**\n"
+            f"Risk level: **{report.risk_level}**\n\n"
             f"The bot will not force a trade."
         )
 
         return
 
-    # Position sizing safety limit
-    max_allowed = (
-        portfolio.cash *
-        (MAX_POSITION_PERCENT / 100)
-    )
+    # --------------------------------------------------------
+    # PAPER TRADE
+    # --------------------------------------------------------
 
-    if amount > max_allowed:
+    paper_cash -= amount
 
-        await interaction.followup.send(
-            f"🛑 Position too large.\n"
-            f"Maximum allowed: **${max_allowed:,.2f}**"
-        )
+    positions[token] = {
+        "amount": amount,
+        "entry_price": 0,
+        "symbol": token[:8],
+    }
 
-        return
-
-    success, message = portfolio.buy(
-        analysis,
+    logger.info(
+        "PAPER BUY | TOKEN=%s | AMOUNT=$%.2f | RISK=%s",
+        token,
         amount,
+        report.risk_score,
     )
 
     await interaction.followup.send(
-        f"{'✅' if success else '❌'} {message}"
+        f"🟢 **PAPER BUY APPROVED**\n\n"
+        f"Amount: **${amount:,.2f}**\n"
+        f"Risk score: **{report.risk_score}/100**\n"
+        f"Risk level: **{report.risk_level}**\n\n"
+        f"💵 Remaining paper cash: "
+        f"**${paper_cash:,.2f}**\n\n"
+        f"⚠️ No real funds were used."
     )
 
 
@@ -813,16 +443,16 @@ async def paperbuy(
 
 @bot.tree.command(
     name="positions",
-    description="Show current paper positions",
+    description="Show open paper positions",
 )
-async def positions(
+async def show_positions(
     interaction: discord.Interaction,
 ):
 
-    if not portfolio.positions:
+    if not positions:
 
         await interaction.response.send_message(
-            "📭 No open positions.",
+            "📭 No open paper positions.",
             ephemeral=True,
         )
 
@@ -830,12 +460,11 @@ async def positions(
 
     lines = []
 
-    for position in portfolio.positions.values():
+    for token, position in positions.items():
 
         lines.append(
-            f"**{position.symbol}**\n"
-            f"Entry: `${position.entry_price:.10f}`\n"
-            f"Invested: `${position.invested_usd:,.2f}`"
+            f"**Token:** `{token}`\n"
+            f"Invested: **${position['amount']:,.2f}**"
         )
 
     await interaction.response.send_message(
@@ -850,80 +479,26 @@ async def positions(
 
 @bot.tree.command(
     name="panic",
-    description="Emergency stop for automated trading",
+    description="Emergency disable for live trading",
 )
 async def panic(
     interaction: discord.Interaction,
 ):
 
-    # This does not sell anything yet.
-    # It prevents future automated execution.
     global LIVE_TRADING
 
     LIVE_TRADING = False
 
     logger.warning(
-        "PANIC STOP ACTIVATED | USER=%s",
+        "PANIC STOP | USER=%s",
         interaction.user,
     )
 
     await interaction.response.send_message(
-        "🚨 **PANIC STOP ACTIVATED**\n"
-        "Live trading has been disabled.",
+        "🚨 **PANIC STOP ACTIVATED**\n\n"
+        "Live trading is disabled.",
         ephemeral=True,
     )
-
-
-# ============================================================
-# AUTOMATIC POSITION MONITOR
-# ============================================================
-
-@tasks.loop(seconds=20)
-async def monitor_positions():
-
-    if not portfolio.positions:
-        return
-
-    addresses = list(
-        portfolio.positions.keys()
-    )
-
-    for address in addresses:
-
-        position = portfolio.positions.get(address)
-
-        if not position:
-            continue
-
-        analysis = await fetch_token(address)
-
-        if not analysis:
-            continue
-
-        reason = check_position_exit(
-            position,
-            analysis,
-        )
-
-        if reason:
-
-            success, message = portfolio.sell(
-                analysis,
-                reason,
-            )
-
-            if success:
-
-                logger.warning(
-                    "AUTOMATIC EXIT | %s",
-                    message,
-                )
-
-
-@monitor_positions.before_loop
-async def before_monitor():
-
-    await bot.wait_until_ready()
 
 
 # ============================================================
@@ -938,40 +513,20 @@ if not DISCORD_TOKEN:
 
 
 logger.info(
-    "=================================================="
+    "PHANTOM AI TRADER STARTING..."
 )
 
 logger.info(
-    "PHANTOM AI TRADER STARTING"
-)
-
-logger.info(
-    "TRADING MODE | %s",
-    "LIVE" if LIVE_TRADING else "PAPER",
-)
-
-logger.info(
-    "LIVE TRADING SAFETY | %s",
+    "LIVE_TRADING=%s",
     LIVE_TRADING,
 )
 
 logger.info(
-    "MAX POSITION | %.2f%%",
-    MAX_POSITION_PERCENT,
+    "RISK ENGINE=ENABLED"
 )
 
 logger.info(
-    "STOP LOSS | %.2f%%",
-    STOP_LOSS_PERCENT,
-)
-
-logger.info(
-    "TAKE PROFIT | %.2f%%",
-    TAKE_PROFIT_PERCENT,
-)
-
-logger.info(
-    "=================================================="
+    "REAL WALLET=NOT CONNECTED"
 )
 
 bot.run(DISCORD_TOKEN)
