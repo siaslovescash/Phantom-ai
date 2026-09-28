@@ -1,59 +1,117 @@
 import os
-import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 from risk_engine import analyze_token
 
 
 # ============================================================
-# CONFIG
+# ENVIRONMENT
 # ============================================================
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-LIVE_TRADING = (
-    os.getenv("LIVE_TRADING", "false").lower() == "true"
-)
+LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
+PAPER_BALANCE = float(os.getenv("PAPER_BALANCE_USD", "1000"))
 
-PAPER_BALANCE = float(
-    os.getenv("PAPER_BALANCE_USD", "1000")
-)
+PORT = int(os.getenv("PORT", "10000"))
+
+
+# ============================================================
+# BASIC VALIDATION
+# ============================================================
+
+if not DISCORD_TOKEN:
+    raise RuntimeError("DISCORD_TOKEN environment variable is missing.")
 
 
 # ============================================================
 # LOGGING
 # ============================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s | %(message)s",
+print("=" * 60)
+print("PHANTOM AI TRADER STARTING")
+print("=" * 60)
+print(f"LIVE_TRADING = {LIVE_TRADING}")
+print(f"PAPER_BALANCE = ${PAPER_BALANCE:.2f}")
+print("=" * 60)
+
+
+# ============================================================
+# RENDER HEALTH SERVER
+# ============================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        if self.path in ("/", "/health", "/health/"):
+            response = b"Phantom AI Trader is running!"
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+
+            self.wfile.write(response)
+
+        else:
+            response = b"Phantom AI Trader"
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+
+            self.wfile.write(response)
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+
+    print(f"RENDER HEALTH SERVER STARTED | PORT={PORT}")
+
+    server.serve_forever()
+
+
+health_thread = threading.Thread(
+    target=start_health_server,
+    daemon=True
 )
 
-logger = logging.getLogger("phantom-ai-trader")
+health_thread.start()
 
 
 # ============================================================
-# PAPER PORTFOLIO
-# ============================================================
-
-paper_cash = PAPER_BALANCE
-positions = {}
-
-
-# ============================================================
-# DISCORD BOT
+# DISCORD INTENTS
 # ============================================================
 
 intents = discord.Intents.default()
 intents.message_content = True
 
+
+# ============================================================
+# BOT
+# ============================================================
+
 bot = commands.Bot(
     command_prefix="!",
-    intents=intents,
+    intents=intents
 )
+
+
+# ============================================================
+# PAPER TRADING DATA
+# ============================================================
+
+paper_balance = PAPER_BALANCE
+
+paper_positions = {}
 
 
 # ============================================================
@@ -63,470 +121,336 @@ bot = commands.Bot(
 @bot.event
 async def on_ready():
 
-    logger.info("==========================================")
-    logger.info("PHANTOM AI TRADER ONLINE")
-    logger.info("BOT USER: %s", bot.user)
-    logger.info(
-        "TRADING MODE: %s",
-        "LIVE" if LIVE_TRADING else "PAPER",
-    )
-    logger.info("PAPER BALANCE: $%.2f", paper_cash)
-    logger.info("==========================================")
+    print("=" * 60)
+    print(f"DISCORD CONNECTED | USER={bot.user}")
+    print(f"GUILDS={len(bot.guilds)}")
+    print("=" * 60)
 
     try:
-
         synced = await bot.tree.sync()
 
-        logger.info(
-            "SYNCED %s SLASH COMMAND(S)",
-            len(synced),
-        )
+        print(f"SYNCED {len(synced)} SLASH COMMAND(S)")
 
         for command in synced:
-            logger.info(
-                "REGISTERED: /%s",
-                command.name,
-            )
+            print(f"REGISTERED: /{command.name}")
 
-    except Exception as exc:
-
-        logger.exception(
-            "COMMAND SYNC ERROR: %s",
-            exc,
-        )
+    except Exception as error:
+        print(f"SLASH COMMAND SYNC ERROR | {error}")
 
 
 # ============================================================
-# /status
+# STATUS
 # ============================================================
 
 @bot.tree.command(
     name="status",
-    description="Show Phantom AI Trader status",
+    description="Show Phantom AI Trader status"
 )
-async def status(
-    interaction: discord.Interaction,
-):
+async def status(interaction: discord.Interaction):
 
-    mode = (
-        "🔴 LIVE TRADING"
-        if LIVE_TRADING
-        else "🟢 PAPER TRADING"
+    print(
+        f"EVENT: /status | "
+        f"USER={interaction.user}"
     )
 
-    embed = discord.Embed(
-        title="🤖 Phantom AI Trader",
-        description="Current bot status",
-    )
-
-    embed.add_field(
-        name="Mode",
-        value=mode,
-        inline=True,
-    )
-
-    embed.add_field(
-        name="Paper Cash",
-        value=f"${paper_cash:,.2f}",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="Open Positions",
-        value=str(len(positions)),
-        inline=True,
-    )
-
-    embed.add_field(
-        name="Risk Engine",
-        value="🟢 ONLINE",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="Real Wallet",
-        value="🔒 NOT CONNECTED",
-        inline=True,
-    )
+    mode = "LIVE TRADING" if LIVE_TRADING else "PAPER TRADING"
 
     await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True,
+        f"🤖 **Phantom AI Trader**\n\n"
+        f"**Mode:** {mode}\n"
+        f"**Paper Balance:** ${paper_balance:,.2f}\n"
+        f"**Open Positions:** {len(paper_positions)}\n"
+        f"**Risk Engine:** ONLINE\n"
+        f"**Render Health Server:** ONLINE"
     )
 
 
 # ============================================================
-# /analyze
+# ANALYZE TOKEN
 # ============================================================
 
 @bot.tree.command(
     name="analyze",
-    description="Run the AI risk engine on a Solana token",
-)
-@app_commands.describe(
-    token="Solana token mint address",
+    description="Analyze a Solana token for trading risk"
 )
 async def analyze(
     interaction: discord.Interaction,
-    token: str,
+    token: str
 ):
 
-    await interaction.response.defer()
-
-    logger.info(
-        "ANALYSIS REQUEST | TOKEN=%s | USER=%s",
-        token,
-        interaction.user,
+    print(
+        f"EVENT: /analyze | "
+        f"USER={interaction.user} | "
+        f"TOKEN={token}"
     )
+
+    await interaction.response.defer()
 
     try:
 
         report = await analyze_token(token)
 
-    except Exception as exc:
+        message = (
+            f"🔎 **TOKEN ANALYSIS**\n\n"
+            f"**Token:** `{token}`\n"
+            f"**Risk Score:** `{report.score}/100`\n"
+            f"**Risk Level:** `{report.risk_level}`\n"
+            f"**Decision:** `{report.decision}`\n\n"
+            f"**Liquidity:** ${report.liquidity:,.2f}\n"
+            f"**24h Volume:** ${report.volume_24h:,.2f}\n"
+            f"**Market Cap:** ${report.market_cap:,.2f}\n"
+            f"**Price:** ${report.price:.10f}\n\n"
+            f"**Reasons:**\n"
+        )
 
-        logger.exception(
-            "RISK ENGINE ERROR: %s",
-            exc,
+        if report.reasons:
+
+            for reason in report.reasons[:10]:
+                message += f"• {reason}\n"
+
+        else:
+            message += "• No additional risk reasons reported.\n"
+
+        await interaction.followup.send(message)
+
+        print(
+            f"ANALYSIS COMPLETE | "
+            f"TOKEN={token} | "
+            f"SCORE={report.score} | "
+            f"DECISION={report.decision}"
+        )
+
+    except Exception as error:
+
+        print(
+            f"ANALYSIS ERROR | "
+            f"TOKEN={token} | "
+            f"ERROR={error}"
         )
 
         await interaction.followup.send(
-            "❌ The risk engine encountered an error."
+            f"❌ Analysis failed.\n"
+            f"`{error}`"
         )
-
-        return
-
-    if report.decision == "BUY-CANDIDATE":
-
-        decision_text = "🟢 BUY CANDIDATE"
-
-    elif report.decision == "WAIT":
-
-        decision_text = "🟡 WAIT"
-
-    else:
-
-        decision_text = "🔴 NO TRADE"
-
-    embed = discord.Embed(
-        title="🧠 Phantom AI Risk Analysis",
-        description=(
-            f"**{report.decision}**\n"
-            f"{decision_text}"
-        ),
-    )
-
-    embed.add_field(
-        name="Risk Score",
-        value=f"{report.risk_score}/100",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="Risk Level",
-        value=report.risk_level,
-        inline=True,
-    )
-
-    embed.add_field(
-        name="Liquidity",
-        value=f"${report.liquidity_usd:,.0f}",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="24h Volume",
-        value=f"${report.volume_24h_usd:,.0f}",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="Market Cap",
-        value=f"${report.market_cap_usd:,.0f}",
-        inline=True,
-    )
-
-    if report.top_holder_percent is not None:
-
-        holder_text = (
-            f"{report.top_holder_percent:.2f}%"
-        )
-
-    else:
-
-        holder_text = "Unavailable"
-
-    embed.add_field(
-        name="Top Holder",
-        value=holder_text,
-        inline=True,
-    )
-
-    # --------------------------------------------------------
-    # RISK REASONS
-    # --------------------------------------------------------
-
-    if report.reasons:
-
-        reasons_text = "\n".join(
-            f"• {reason}"
-            for reason in report.reasons
-        )
-
-    else:
-
-        reasons_text = (
-            "No major negative signals returned."
-        )
-
-    embed.add_field(
-        name="Risk Signals",
-        value=reasons_text[:1024],
-        inline=False,
-    )
-
-    # --------------------------------------------------------
-    # WARNINGS
-    # --------------------------------------------------------
-
-    if report.warnings:
-
-        warnings_text = "\n".join(
-            f"• {warning}"
-            for warning in report.warnings
-        )
-
-        embed.add_field(
-            name="Warnings",
-            value=warnings_text[:1024],
-            inline=False,
-        )
-
-    embed.set_footer(
-        text=(
-            "Risk analysis is not a guarantee against "
-            "loss or a rug."
-        )
-    )
-
-    await interaction.followup.send(
-        embed=embed
-    )
 
 
 # ============================================================
-# /paperbuy
+# PAPER BUY
 # ============================================================
 
 @bot.tree.command(
     name="paperbuy",
-    description="Simulate a trade after risk analysis",
-)
-@app_commands.describe(
-    token="Solana token mint address",
-    amount="USD amount to simulate",
+    description="Simulate a token purchase"
 )
 async def paperbuy(
     interaction: discord.Interaction,
     token: str,
-    amount: float,
+    amount: float
 ):
 
-    global paper_cash
+    global paper_balance
 
-    await interaction.response.defer()
+    print(
+        f"EVENT: /paperbuy | "
+        f"USER={interaction.user} | "
+        f"TOKEN={token} | "
+        f"AMOUNT=${amount:.2f}"
+    )
 
-    # --------------------------------------------------------
-    # BASIC AMOUNT CHECK
-    # --------------------------------------------------------
+    if LIVE_TRADING:
+
+        await interaction.response.send_message(
+            "⚠️ Live trading mode is enabled, but real execution "
+            "is not connected yet."
+        )
+
+        return
 
     if amount <= 0:
 
-        await interaction.followup.send(
+        await interaction.response.send_message(
             "❌ Amount must be greater than $0."
         )
 
         return
 
-    # Maximum paper position = 5% of starting balance
-    max_position = PAPER_BALANCE * 0.05
+    if amount > paper_balance:
 
-    if amount > max_position:
-
-        await interaction.followup.send(
-            f"🛑 Position rejected.\n\n"
-            f"Maximum paper position: "
-            f"**${max_position:,.2f}**"
+        await interaction.response.send_message(
+            f"❌ Insufficient paper balance.\n"
+            f"Available: ${paper_balance:,.2f}"
         )
 
         return
 
-    if amount > paper_cash:
-
-        await interaction.followup.send(
-            "❌ Insufficient paper balance."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # RUN RISK ENGINE
-    # --------------------------------------------------------
+    await interaction.response.defer()
 
     try:
 
         report = await analyze_token(token)
 
-    except Exception as exc:
+        if report.decision != "BUY-CANDIDATE":
 
-        logger.exception(
-            "PAPER BUY ANALYSIS ERROR: %s",
-            exc,
+            await interaction.followup.send(
+                f"🛑 **PAPER BUY BLOCKED**\n\n"
+                f"Token: `{token}`\n"
+                f"Risk Score: `{report.score}/100`\n"
+                f"Risk Level: `{report.risk_level}`\n"
+                f"Decision: `{report.decision}`\n\n"
+                f"The risk engine did not approve this token."
+            )
+
+            print(
+                f"PAPER BUY BLOCKED | "
+                f"TOKEN={token} | "
+                f"DECISION={report.decision}"
+            )
+
+            return
+
+        paper_balance -= amount
+
+        if token in paper_positions:
+
+            paper_positions[token]["amount_usd"] += amount
+
+        else:
+
+            paper_positions[token] = {
+                "amount_usd": amount,
+                "entry_price": report.price,
+            }
+
+        await interaction.followup.send(
+            f"🟢 **PAPER BUY EXECUTED**\n\n"
+            f"**Token:** `{token}`\n"
+            f"**Amount:** ${amount:,.2f}\n"
+            f"**Entry Price:** ${report.price:.10f}\n"
+            f"**Risk Score:** {report.score}/100\n"
+            f"**Remaining Balance:** ${paper_balance:,.2f}"
+        )
+
+        print(
+            f"PAPER BUY COMPLETE | "
+            f"TOKEN={token} | "
+            f"AMOUNT=${amount:.2f} | "
+            f"BALANCE=${paper_balance:.2f}"
+        )
+
+    except Exception as error:
+
+        print(
+            f"PAPER BUY ERROR | "
+            f"TOKEN={token} | "
+            f"ERROR={error}"
         )
 
         await interaction.followup.send(
-            "❌ Risk analysis failed. "
-            "Trade rejected for safety."
+            f"❌ Paper buy failed.\n"
+            f"`{error}`"
         )
-
-        return
-
-    # --------------------------------------------------------
-    # RISK ENGINE MUST APPROVE
-    # --------------------------------------------------------
-
-    if report.decision != "BUY-CANDIDATE":
-
-        await interaction.followup.send(
-            f"🛑 **TRADE REJECTED**\n\n"
-            f"Decision: **{report.decision}**\n"
-            f"Risk score: **{report.risk_score}/100**\n"
-            f"Risk level: **{report.risk_level}**\n\n"
-            f"The bot will not force a trade."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # PAPER TRADE
-    # --------------------------------------------------------
-
-    paper_cash -= amount
-
-    positions[token] = {
-        "amount": amount,
-        "entry_price": 0,
-        "symbol": token[:8],
-    }
-
-    logger.info(
-        "PAPER BUY | TOKEN=%s | AMOUNT=$%.2f | RISK=%s",
-        token,
-        amount,
-        report.risk_score,
-    )
-
-    await interaction.followup.send(
-        f"🟢 **PAPER BUY APPROVED**\n\n"
-        f"Amount: **${amount:,.2f}**\n"
-        f"Risk score: **{report.risk_score}/100**\n"
-        f"Risk level: **{report.risk_level}**\n\n"
-        f"💵 Remaining paper cash: "
-        f"**${paper_cash:,.2f}**\n\n"
-        f"⚠️ No real funds were used."
-    )
 
 
 # ============================================================
-# /positions
+# POSITIONS
 # ============================================================
 
 @bot.tree.command(
     name="positions",
-    description="Show open paper positions",
+    description="Show current paper trading positions"
 )
-async def show_positions(
-    interaction: discord.Interaction,
-):
+async def positions(interaction: discord.Interaction):
 
-    if not positions:
+    print(
+        f"EVENT: /positions | "
+        f"USER={interaction.user}"
+    )
+
+    if not paper_positions:
 
         await interaction.response.send_message(
-            "📭 No open paper positions.",
-            ephemeral=True,
+            f"📊 **PAPER POSITIONS**\n\n"
+            f"No open positions.\n\n"
+            f"**Available Balance:** "
+            f"${paper_balance:,.2f}"
         )
 
         return
 
-    lines = []
+    message = (
+        f"📊 **PAPER POSITIONS**\n\n"
+        f"**Available Balance:** ${paper_balance:,.2f}\n\n"
+    )
 
-    for token, position in positions.items():
+    for token, position in paper_positions.items():
 
-        lines.append(
-            f"**Token:** `{token}`\n"
-            f"Invested: **${position['amount']:,.2f}**"
+        message += (
+            f"**{token}**\n"
+            f"• Position: ${position['amount_usd']:,.2f}\n"
+            f"• Entry: ${position['entry_price']:.10f}\n\n"
         )
 
-    await interaction.response.send_message(
-        "\n\n".join(lines),
-        ephemeral=True,
-    )
+    await interaction.response.send_message(message)
 
 
 # ============================================================
-# /panic
+# PANIC
 # ============================================================
 
 @bot.tree.command(
     name="panic",
-    description="Emergency disable for live trading",
+    description="Close all paper trading positions"
 )
-async def panic(
-    interaction: discord.Interaction,
-):
+async def panic(interaction: discord.Interaction):
 
-    global LIVE_TRADING
+    global paper_balance
 
-    LIVE_TRADING = False
-
-    logger.warning(
-        "PANIC STOP | USER=%s",
-        interaction.user,
+    print(
+        f"EVENT: /panic | "
+        f"USER={interaction.user}"
     )
+
+    total_closed = sum(
+        position["amount_usd"]
+        for position in paper_positions.values()
+    )
+
+    paper_balance += total_closed
+
+    paper_positions.clear()
 
     await interaction.response.send_message(
-        "🚨 **PANIC STOP ACTIVATED**\n\n"
-        "Live trading is disabled.",
-        ephemeral=True,
+        f"🚨 **PANIC MODE EXECUTED**\n\n"
+        f"All paper positions have been closed.\n"
+        f"Returned to paper balance: ${total_closed:,.2f}\n"
+        f"Current balance: ${paper_balance:,.2f}\n\n"
+        f"⚠️ No real trades were executed."
+    )
+
+    print(
+        f"PANIC COMPLETE | "
+        f"RETURNED=${total_closed:.2f} | "
+        f"BALANCE=${paper_balance:.2f}"
     )
 
 
 # ============================================================
-# STARTUP
+# GLOBAL ERROR HANDLER
 # ============================================================
 
-if not DISCORD_TOKEN:
+@bot.event
+async def on_error(event, *args, **kwargs):
 
-    raise RuntimeError(
-        "DISCORD_TOKEN environment variable is missing."
+    print(
+        f"DISCORD EVENT ERROR | "
+        f"EVENT={event}"
     )
 
 
-logger.info(
-    "PHANTOM AI TRADER STARTING..."
-)
+# ============================================================
+# START BOT
+# ============================================================
 
-logger.info(
-    "LIVE_TRADING=%s",
-    LIVE_TRADING,
-)
-
-logger.info(
-    "RISK ENGINE=ENABLED"
-)
-
-logger.info(
-    "REAL WALLET=NOT CONNECTED"
-)
+print("STARTING DISCORD BOT...")
 
 bot.run(DISCORD_TOKEN)
